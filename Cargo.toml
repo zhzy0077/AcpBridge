@@ -1,0 +1,62 @@
+[package]
+name = "acpconnector"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+unstable_session_usage = ["agent-client-protocol/unstable_session_usage"]
+unstable_session_model = ["agent-client-protocol/unstable_session_model"]
+
+[dependencies]
+# ACP SDK - Agent Client Protocol
+agent-client-protocol = { version = "0.10", features = ["unstable_session_usage", "unstable_session_model"] }
+
+# Telegram Bot
+teloxide = { version = "0.12", features = ["macros"] }
+
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["compat", "io"] }
+
+# Async trait
+async-trait = "0.1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# Error handling
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Async file/IO
+futures = "0.3"
+piper = "0.2"
+
+# WebSocket client for QQ Bot
+tokio-tungstenite = { version = "0.26", features = ["rustls-tls-native-roots"] }
+
+# HTTP client for QQ Bot API
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+
+# Lark/Feishu Bot
+openlark-client = { version = "0.15.0-rc.1", features = ["websocket"] }
+
+# MCP SDK
+rmcp = { version = "1.2", features = ["server", "transport-streamable-http-server"] }
+
+# 并发缓存（Channel 内部使用）
+dashmap = "6"
+
+# Base64 encoding (used by WeChat channel)
+base64 = "0.22"
+rand = "0.8"
+
+# HTTP server for MCP
+axum = "0.8"
+urlencoding = "2"
+

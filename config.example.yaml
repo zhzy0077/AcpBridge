@@ -1,0 +1,85 @@
+# ACP Connector Configuration Example
+#
+# Copy this file to config.yaml and update with your settings
+
+# Optional: MCP Server configuration
+# mcp_server:
+#   port: 8080
+
+# Bot definitions - top-level, reusable across channels
+bots:
+  # Example: Claude Code bot
+  - name: plan-agent
+    # Optional: Bot description
+    description: "负责需求分析和计划制定"
+    agent:
+      # Command to run (must support ACP protocol)
+      command: claude-code
+      # Arguments passed to the agent
+      args: ["--acp"]
+    # Working directory for the agent
+    working_dir: /home/user/project
+    # Default model to use
+    model: claude-sonnet
+    # Optional ACP session config options (for example, Copilot exposes reasoning_effort)
+    config_options:
+      reasoning_effort: high
+    # Instructions to prepend to the first user message
+    instructions: |
+      你是 Plan Agent。负责分析需求并制定实现计划。
+    # Whether to show agent thinking chunks to users (default: true)
+    show_thinking: true
+    # Whether to show "[Auto-approved tool]" messages to users (default: true)
+    show_auto_approved: true
+
+  # Example: Another bot for code execution
+  - name: execute-agent
+    description: "负责执行代码修改"
+    agent:
+      command: gemini
+      args: ["--acp"]
+    working_dir: /home/user/project
+    model: gemini-pro
+    instructions: "你是 Execute Agent。负责执行代码修改。"
+
+  # Example: Simple bot with minimal config
+  - name: simple-bot
+    agent:
+      command: claude-code
+      args: ["--acp"]
+
+# Channel definitions - connect to messaging platforms
+channels:
+  # Example: Telegram channel with multiple bots
+  - name: my-telegram
+    telegram:
+      # Replace with your Telegram bot token from @BotFather
+      token: "YOUR_TELEGRAM_BOT_TOKEN"
+    # When enabled, group-chat text is forwarded to ACP only if the bot is mentioned
+    mention_only: false
+    # Default bot for new chats
+    default_bot: plan-agent
+    # Bots available on this channel (users can switch with /bot command)
+    bots: [plan-agent, execute-agent, simple-bot]
+
+  # Example: QQ Bot channel
+  # Uncomment and configure to enable
+  # - name: my-qq
+  #   qq:
+  #     app_id: "YOUR_QQ_BOT_APP_ID"
+  #     client_secret: "YOUR_QQ_BOT_CLIENT_SECRET"
+  #   mention_only: false
+  #   default_bot: plan-agent
+  #   bots: [plan-agent]
+
+  # Example: Lark/Feishu Bot channel
+  # Uncomment and configure to enable
+  # - name: my-lark
+  #   lark:
+  #     app_id: "YOUR_LARK_APP_ID"
+  #     app_secret: "YOUR_LARK_APP_SECRET"
+  #     # Optional: Base URL (default: https://open.feishu.cn)
+  #     # base_url: "https://open.larksuite.com"  # For Lark International
+  #   mention_only: false
+  #   default_bot: plan-agent
+  #   bots: [plan-agent, execute-agent]
