@@ -8,7 +8,7 @@
 //! - Cleans up idle Bots
 
 use crate::bot::Bot;
-use crate::channel::{Channel, ChatId, OutgoingContent, OutgoingMessage};
+use crate::channel::{ChatId, OutgoingContent, OutgoingMessage};
 use crate::config::Config;
 use crate::message_bus::{BotInstanceKey, MessageBus};
 use anyhow::{Result, anyhow};
@@ -37,8 +37,6 @@ pub struct Orchestrator {
     /// Running bot instances.
     /// Key: (channel_name, chat_id, bot_name)
     running_bots: Mutex<HashMap<(String, ChatId, String), RunningBot>>,
-    /// Channel instances registered at startup, used for search_bots_in_chat.
-    channels: Mutex<HashMap<String, Arc<dyn Channel>>>,
 }
 
 impl Orchestrator {
@@ -50,13 +48,7 @@ impl Orchestrator {
             mcp_server_port,
             active_bots: Mutex::new(HashMap::new()),
             running_bots: Mutex::new(HashMap::new()),
-            channels: Mutex::new(HashMap::new()),
         }
-    }
-
-    /// Register a channel instance for bot discovery via search_bots_in_chat.
-    pub async fn register_channel(&self, name: String, channel: Arc<dyn Channel>) {
-        self.channels.lock().await.insert(name, channel);
     }
 
     /// Get or create the active bot for a (channel, chat_id).
@@ -387,40 +379,35 @@ impl Orchestrator {
 
     /// Search for other bots in the same chat (for MCP).
     ///
-    /// Calls the platform API via the channel's `search_bots_in_chat` to find which
-    /// other bots are actually present in the group. Falls back to returning all
-    /// configured bots for the channel if the platform doesn't support discovery.
+    /// Looks up running bot instances in `running_bots` that share the same
+    /// `chat_id` across all channels. Falls back to returning all configured
+    /// bots for the channel if no other bots have been active yet.
     pub async fn search_bots(
         &self,
         channel_name: &str,
         chat_id: &ChatId,
         caller_bot: &str,
     ) -> Vec<BotInfo> {
-        let channel = self.channels.lock().await.get(channel_name).cloned();
+        // In-memory lookup: find all bots active in this chat across all channels
+        let running = self.running_bots.lock().await;
+        let mut seen = std::collections::HashSet::new();
+        let mut result = Vec::new();
 
-        if let Some(channel) = channel {
-            let found_channel_names = channel.search_bots_in_chat(chat_id).await;
-            if !found_channel_names.is_empty() {
-                // Map discovered channel_names to their configured bots
-                let mut result = Vec::new();
-                for cn in &found_channel_names {
-                    if let Some(channel_config) =
-                        self.config.channels.iter().find(|c| &c.name == cn)
-                    {
-                        for bot_name in &channel_config.bots {
-                            if bot_name != caller_bot
-                                && let Some(b) = self.config.get_bot(bot_name)
-                            {
-                                result.push(BotInfo {
-                                    name: b.name.clone(),
-                                    description: b.description.clone(),
-                                });
-                            }
-                        }
-                    }
+        for (key, _) in running.iter() {
+            let (_, ref cid, ref bot_name) = *key;
+            if cid == chat_id && bot_name != caller_bot && seen.insert(bot_name.clone()) {
+                if let Some(b) = self.config.get_bot(bot_name) {
+                    result.push(BotInfo {
+                        name: b.name.clone(),
+                        description: b.description.clone(),
+                    });
                 }
-                return result;
             }
+        }
+        drop(running);
+
+        if !result.is_empty() {
+            return result;
         }
 
         // Fallback: return all configured bots for this channel

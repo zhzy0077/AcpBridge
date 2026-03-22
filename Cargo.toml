@@ -1,11 +1,7 @@
 [package]
-name = "acpconnector"
+name = "acpbridge"
 version = "0.1.0"
 edition = "2024"
-
-[features]
-unstable_session_usage = ["agent-client-protocol/unstable_session_usage"]
-unstable_session_model = ["agent-client-protocol/unstable_session_model"]
 
 [dependencies]
 # ACP SDK - Agent Client Protocol

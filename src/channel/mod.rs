@@ -110,17 +110,6 @@ pub trait Channel: Send + Sync {
         orchestrator: std::sync::Arc<crate::orchestrator::Orchestrator>,
         message_bus: std::sync::Arc<crate::message_bus::MessageBus>,
     ) -> anyhow::Result<()>;
-
-    /// Search for other bots present in the given chat.
-    ///
-    /// Queries the platform API to find which bots are members of the chat,
-    /// then maps their platform IDs back to channel names using the platform's
-    /// static bot registry. Returns the channel names of other bots in the chat.
-    ///
-    /// Default implementation returns empty (platforms that don't support discovery).
-    async fn search_bots_in_chat(&self, _chat_id: &ChatId) -> Vec<String> {
-        vec![]
-    }
 }
 
 #[cfg(test)]
