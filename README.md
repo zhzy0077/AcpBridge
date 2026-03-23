@@ -128,7 +128,7 @@ ACP_CONFIG=/path/to/config.yaml ./target/release/acpbridge
 | `config_options` | map | No | ACP session config options (e.g., `reasoning_effort`) |
 | `instructions` | string | No | System prompt prepended to first message |
 | `show_thinking` | bool | No | Show thinking chunks (default: true) |
-| `show_auto_approved` | bool | No | Show auto-approval notices (default: true) |
+| `show_auto_approved` | bool | No | Show auto-approval notices (default: false) |
 
 ### Channel Configuration
 
