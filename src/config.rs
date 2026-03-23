@@ -91,6 +91,7 @@ pub enum PlatformConfig {
     Qq { qq: QqConfig },
     Lark { lark: LarkConfig },
     Wechat { wechat: WeChatConfig },
+    Discord { discord: DiscordConfig },
 }
 
 /// MCP Server configuration
@@ -145,6 +146,14 @@ pub struct WeChatConfig {
 
 fn default_wechat_base_url() -> String {
     "https://ilinkai.weixin.qq.com".to_string()
+}
+
+/// Discord Bot-specific configuration
+#[derive(Debug, Clone, Deserialize)]
+pub struct DiscordConfig {
+    pub bot_token: String,
+    /// Optional: restrict to specific guild (server) IDs
+    pub guild_ids: Option<Vec<String>>,
 }
 
 impl Config {

@@ -83,3 +83,14 @@ channels:
   #   mention_only: false
   #   default_bot: plan-agent
   #   bots: [plan-agent, execute-agent]
+
+  # Example: Discord Bot channel
+  # Uncomment and configure to enable
+  # - name: my-discord
+  #   discord:
+  #     bot_token: "YOUR_DISCORD_BOT_TOKEN"
+  #     # Optional: restrict to specific guild (server) IDs
+  #     # guild_ids: ["123456789012345678"]
+  #   mention_only: false
+  #   default_bot: plan-agent
+  #   bots: [plan-agent, execute-agent]

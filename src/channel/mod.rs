@@ -4,11 +4,13 @@
 //! messaging platforms (Telegram, QQ, Lark/Feishu, etc.). Each platform implements
 //! this trait to handle message sending and receiving.
 
+mod discord;
 mod lark;
 mod qq;
 mod telegram;
 mod wechat;
 
+pub use discord::DiscordChannel;
 pub use lark::LarkChannel;
 pub use qq::QqChannel;
 pub use telegram::TelegramChannel;

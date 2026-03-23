@@ -93,6 +93,13 @@ async fn main() -> Result<()> {
                             channel_config.mention_only,
                         ))
                     }
+                    config::PlatformConfig::Discord { discord } => {
+                        Arc::new(channel::DiscordChannel::new(
+                            discord.bot_token.clone(),
+                            discord.guild_ids.clone(),
+                            channel_config.mention_only,
+                        ))
+                    }
                 };
 
                 let orch = orchestrator.clone();
