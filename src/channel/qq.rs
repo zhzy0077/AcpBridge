@@ -1,39 +1,49 @@
-//! QQ Bot channel implementation
+//! QQ Bot channel adapter implementation
 //!
 //! Implements WebSocket-based connection to QQ Bot Open Platform.
 //! Supports C2C (single chat) and Group (@bot) message scenarios.
 
-use crate::channel::{
-    Channel, ChatId, IncomingContent, IncomingMessage, OutgoingContent, OutgoingMessage,
-};
-use crate::message_bus::BotInstanceKey;
+use crate::channel::{ChannelAdapter, ChatId, RawIncoming};
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
 use futures::{SinkExt, StreamExt};
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock};
-use std::time::{Duration, Instant, SystemTime};
+use std::time::{Duration, SystemTime};
 use tokio::sync::{RwLock, mpsc};
-use tokio::time::{MissedTickBehavior, interval, sleep};
+use tokio::time::sleep;
 use tokio_tungstenite::{connect_async, tungstenite::Message as WsMessage};
 use tracing::{debug, error, info, warn};
 
 /// Static registry: QQ bot_id → channel_name.
-/// Populated at startup when each QqChannel connects and fetches its own bot_id.
+/// Populated at startup when each QqAdapter connects and fetches its own bot_id.
 static QQ_BOT_REGISTRY: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
 
-/// QQ Bot channel
-#[derive(Debug)]
-pub struct QqChannel {
-    http_client: HttpClient,
-    token_manager: Arc<TokenManager>,
-    bot_id_cache: Arc<tokio::sync::OnceCell<Option<String>>>,
+/// Message sequence generator
+static MSG_SEQ: AtomicU64 = AtomicU64::new(1);
+
+/// QQ single message max length (recommendation)
+const MAX_MESSAGE_LENGTH: usize = 4096;
+
+fn generate_msg_seq() -> u64 {
+    MSG_SEQ.fetch_add(1, Ordering::SeqCst)
 }
 
-impl QqChannel {
-    pub fn new(app_id: String, client_secret: String, _mention_only: bool) -> Self {
+/// QQ Bot adapter
+#[derive(Debug)]
+pub struct QqAdapter {
+    http_client: HttpClient,
+    token_manager: Arc<TokenManager>,
+    /// Recent message IDs for passive reply (chat_id -> msg_id)
+    recent_msg_ids: Arc<RwLock<HashMap<String, String>>>,
+    channel_name: String,
+}
+
+impl QqAdapter {
+    pub fn new(app_id: String, client_secret: String, channel_name: String) -> Self {
         let http_client = HttpClient::new();
         let token_manager = Arc::new(TokenManager::new(
             app_id,
@@ -43,261 +53,125 @@ impl QqChannel {
         Self {
             http_client,
             token_manager,
-            bot_id_cache: Arc::new(tokio::sync::OnceCell::new()),
+            recent_msg_ids: Arc::new(RwLock::new(HashMap::new())),
+            channel_name,
+        }
+    }
+
+    /// Get the bot registry for mention formatting
+    pub fn get_registry() -> &'static DashMap<String, String> {
+        &QQ_BOT_REGISTRY
+    }
+
+    /// Fetch and register bot ID in the registry
+    async fn register_bot_id(&self) {
+        // Fetch bot ID using users/@me endpoint
+        #[derive(Deserialize)]
+        struct Me {
+            id: String,
+        }
+
+        if let Ok(token) = self.token_manager.get_token().await {
+            let resp = self
+                .http_client
+                .get("https://api.sgroup.qq.com/users/@me")
+                .header("Authorization", format!("QQBot {}", token))
+                .send()
+                .await;
+
+            if let Ok(resp) = resp
+                && resp.status().is_success()
+                && let Ok(me) = resp.json::<Me>().await
+            {
+                let bot_id = me.id.clone();
+                QQ_BOT_REGISTRY.insert(me.id, self.channel_name.clone());
+                info!(channel = %self.channel_name, bot_id = %bot_id, "Registered QQ bot in registry");
+            } else {
+                warn!(channel = %self.channel_name, "Could not fetch QQ bot id; mentions will use plain text");
+            }
         }
     }
 }
 
 #[async_trait::async_trait]
-impl Channel for QqChannel {
-    async fn start(
+impl ChannelAdapter for QqAdapter {
+    fn platform(&self) -> &'static str {
+        "qq"
+    }
+
+    fn max_message_length(&self) -> usize {
+        MAX_MESSAGE_LENGTH
+    }
+
+    async fn run_incoming(
         &self,
-        channel_name: String,
-        orchestrator: Arc<crate::orchestrator::Orchestrator>,
-        message_bus: Arc<crate::message_bus::MessageBus>,
-    ) -> Result<()> {
-        // Eagerly register own bot_id so peers can discover us via QQ_BOT_REGISTRY
-        let bot_id = self
-            .bot_id_cache
-            .get_or_init(|| async {
-                let token = match self.token_manager.get_token().await {
-                    Ok(t) => t,
-                    Err(_) => return None,
-                };
-                #[derive(Deserialize)]
-                struct Me {
-                    id: String,
-                }
-                let resp = match self
-                    .http_client
-                    .get("https://api.sgroup.qq.com/users/@me")
-                    .header("Authorization", format!("QQBot {}", token))
-                    .send()
-                    .await
-                {
-                    Ok(r) if r.status().is_success() => r,
-                    _ => return None,
-                };
-                resp.json::<Me>().await.ok().map(|m| m.id)
-            })
-            .await
-            .clone();
+        incoming_tx: mpsc::Sender<RawIncoming>,
+    ) -> anyhow::Result<()> {
+        // Register bot ID in registry for native mentions
+        self.register_bot_id().await;
 
-        if let Some(ref id) = bot_id {
-            QQ_BOT_REGISTRY.insert(id.clone(), channel_name.clone());
-            info!(channel = %channel_name, "Registered QQ bot in registry");
-        } else {
-            warn!(channel = %channel_name, "Could not fetch QQ bot id; mentions will use plain text");
-        }
-
-        let manager = Arc::new(QqBotManager::new(
-            channel_name,
-            orchestrator,
-            message_bus,
-            self.http_client.clone(),
-            self.token_manager.clone(),
-        ));
-
-        // Create outgoing channel and register with MessageBus
-        let (outgoing_tx, outgoing_rx) = mpsc::channel::<(ChatId, OutgoingMessage)>(100);
-        manager
-            .message_bus
-            .register_channel(manager.channel_name.clone(), outgoing_tx)
-            .await;
-
-        manager.run(outgoing_rx).await
-    }
-}
-
-/// QQ Bot connection manager
-struct QqBotManager {
-    http_client: HttpClient,
-    token_manager: Arc<TokenManager>,
-    channel_name: String,
-    orchestrator: Arc<crate::orchestrator::Orchestrator>,
-    message_bus: Arc<crate::message_bus::MessageBus>,
-    /// Recent message IDs for passive reply (chat_id -> msg_id)
-    recent_msg_ids: Arc<RwLock<HashMap<String, String>>>,
-}
-
-impl QqBotManager {
-    fn new(
-        channel_name: String,
-        orchestrator: Arc<crate::orchestrator::Orchestrator>,
-        message_bus: Arc<crate::message_bus::MessageBus>,
-        http_client: HttpClient,
-        token_manager: Arc<TokenManager>,
-    ) -> Self {
-        Self {
-            http_client,
-            token_manager,
-            channel_name,
-            orchestrator,
-            message_bus,
-            recent_msg_ids: Arc::new(RwLock::new(HashMap::new())),
-        }
-    }
-
-    async fn run(&self, mut outgoing_rx: mpsc::Receiver<(ChatId, OutgoingMessage)>) -> Result<()> {
-        let token_manager = self.token_manager.clone();
-        let channel_name = self.channel_name.clone();
-        let orchestrator = self.orchestrator.clone();
-        let message_bus = self.message_bus.clone();
-        let recent_msg_ids = self.recent_msg_ids.clone();
         let session_state = Arc::new(SessionState::new());
 
-        // Spawn WebSocket connection task
-        let ws_handle = tokio::spawn(async move {
-            let mut reconnect_delay = Duration::from_secs(1);
-            const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
+        let mut reconnect_delay = Duration::from_secs(1);
+        const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 
-            loop {
-                match run_websocket_connection(
-                    &token_manager,
-                    &channel_name,
-                    &orchestrator,
-                    &message_bus,
-                    &recent_msg_ids,
-                    &session_state,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        info!(
-                            "WebSocket connection closed gracefully, reconnecting in {:?}",
-                            reconnect_delay
-                        );
-                        sleep(reconnect_delay).await;
-                        reconnect_delay = std::cmp::min(reconnect_delay * 2, MAX_RECONNECT_DELAY);
-                    }
-                    Err(e) => {
-                        error!(error = %e, "WebSocket connection error, reconnecting in {:?}", reconnect_delay);
-                        sleep(reconnect_delay).await;
-                        reconnect_delay = std::cmp::min(reconnect_delay * 2, MAX_RECONNECT_DELAY);
-                    }
+        loop {
+            match run_websocket_connection(
+                &self.token_manager,
+                &self.recent_msg_ids,
+                &session_state,
+                incoming_tx.clone(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    info!(
+                        "WebSocket connection closed gracefully, reconnecting in {:?}",
+                        reconnect_delay
+                    );
+                    sleep(reconnect_delay).await;
+                    reconnect_delay = std::cmp::min(reconnect_delay * 2, MAX_RECONNECT_DELAY);
+                }
+                Err(e) => {
+                    error!(error = %e, "WebSocket connection error, reconnecting in {:?}", reconnect_delay);
+                    sleep(reconnect_delay).await;
+                    reconnect_delay = std::cmp::min(reconnect_delay * 2, MAX_RECONNECT_DELAY);
                 }
             }
-        });
-
-        // Handle outgoing messages
-        let recent_msg_ids = self.recent_msg_ids.clone();
-        let token_manager = self.token_manager.clone();
-        let http_client = self.http_client.clone();
-
-        let outgoing_handle = tokio::spawn(async move {
-            // 本地状态管理，无需 Arc<RwLock>
-            let mut stream_buffers: HashMap<String, (String, std::time::Instant)> = HashMap::new();
-
-            // 定时器用于检查超时（30秒）
-            let mut timeout_checker = interval(Duration::from_secs(5));
-            timeout_checker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    // 处理新的 outgoing 消息
-                    Some((chat_id, msg)) = outgoing_rx.recv() => {
-                        let chat_id_str = chat_id.0.clone();
-
-                        match msg.content {
-                            OutgoingContent::Text(text) => {
-                                // 非流式消息直接发送
-                                if let Err(e) = send_message(
-                                    &http_client,
-                                    &token_manager,
-                                    &chat_id,
-                                    &text,
-                                    &recent_msg_ids,
-                                ).await {
-                                    error!(error = %e, chat_id = %chat_id_str, "Failed to send message");
-                                }
-                            }
-                            OutgoingContent::StreamChunk(text) => {
-                                // 缓冲模式：累积到缓冲区，更新时间戳
-                                let now = Instant::now();
-                                stream_buffers
-                                    .entry(chat_id_str)
-                                    .and_modify(|(buf, ts)| {
-                                        buf.push_str(&text);
-                                        *ts = now;
-                                    })
-                                    .or_insert((text, now));
-                            }
-                            OutgoingContent::StreamEnd => {
-                                // 流式结束：发送缓冲的内容，并从 HashMap 中移除（避免内存泄漏）
-                                if let Some((content, _)) = stream_buffers.remove(&chat_id_str)
-                                    && !content.is_empty()
-                                    && let Err(e) = send_message(
-                                        &http_client,
-                                        &token_manager,
-                                        &chat_id,
-                                        &content,
-                                        &recent_msg_ids,
-                                    )
-                                    .await
-                                {
-                                    error!(error = %e, chat_id = %chat_id_str, "Failed to send stream message");
-                                }
-                            }
-                            OutgoingContent::Error(err) => {
-                                let content = format!("Error: {}", err);
-                                if let Err(e) = send_message(
-                                    &http_client,
-                                    &token_manager,
-                                    &chat_id,
-                                    &content,
-                                    &recent_msg_ids,
-                                ).await {
-                                    error!(error = %e, chat_id = %chat_id_str, "Failed to send error");
-                                }
-                            }
-                            OutgoingContent::Mention { target_bot, target_channel_name, message } => {
-                                // Look up target's bot_id via the static registry
-                                let bot_id = target_channel_name.as_deref().and_then(|cn| {
-                                    QQ_BOT_REGISTRY
-                                        .iter()
-                                        .find(|e| e.value() == cn)
-                                        .map(|e| e.key().clone())
-                                });
-                                let full_message = match bot_id {
-                                    Some(id) => format!("<@!{}> {}", id, message),
-                                    None => {
-                                        warn!(target_bot = %target_bot, "Target bot id not in QQ registry, falling back to plain mention");
-                                        format!("@{} {}", target_bot, message)
-                                    }
-                                };
-                                if let Err(e) = send_message(
-                                    &http_client,
-                                    &token_manager,
-                                    &chat_id,
-                                    &full_message,
-                                    &recent_msg_ids,
-                                ).await {
-                                    error!(error = %e, chat_id = %chat_id_str, "Failed to send mention");
-                                }
-                            }
-                        }
-                    }
-                    // 定期检查超时（30秒）
-                    _ = timeout_checker.tick() => {
-                        check_and_flush_timeouts(
-                            &http_client,
-                            &token_manager,
-                            &mut stream_buffers,
-                            &recent_msg_ids,
-                        ).await;
-                    }
-                    // 通道关闭时退出
-                    else => break,
-                }
-            }
-        });
-
-        tokio::select! {
-            _ = ws_handle => {},
-            _ = outgoing_handle => {},
         }
+    }
 
-        Ok(())
+    async fn send_text(&self, chat_id: &ChatId, text: &str) -> Result<()> {
+        send_message(
+            &self.http_client,
+            &self.token_manager,
+            chat_id,
+            text,
+            &self.recent_msg_ids,
+        )
+        .await
+    }
+
+    fn format_mention(
+        &self,
+        target_bot: &str,
+        target_channel_name: Option<&str>,
+        message: &str,
+    ) -> String {
+        // Look up target's bot_id via the static registry
+        let bot_id = target_channel_name.and_then(|cn| {
+            QQ_BOT_REGISTRY
+                .iter()
+                .find(|e| e.value() == cn)
+                .map(|e| e.key().clone())
+        });
+        match bot_id {
+            Some(id) => format!("<@!{}> {}", id, message),
+            None => {
+                warn!(target_bot = %target_bot, "Target bot id not in QQ registry, falling back to plain mention");
+                format!("@{} {}", target_bot, message)
+            }
+        }
     }
 }
 
@@ -308,7 +182,6 @@ struct TokenManager {
     client_secret: String,
     http_client: HttpClient,
     token: RwLock<Option<TokenInfo>>,
-    /// Mutex to ensure only one request fetches token at a time
     refresh_lock: tokio::sync::Mutex<()>,
 }
 
@@ -330,7 +203,7 @@ impl TokenManager {
     }
 
     async fn get_token(&self) -> Result<String> {
-        // Fast path: Check if we have a valid cached token (read lock only)
+        // Fast path: Check if we have a valid cached token
         {
             let token_guard = self.token.read().await;
             if let Some(token) = token_guard.as_ref()
@@ -340,10 +213,10 @@ impl TokenManager {
             }
         }
 
-        // Slow path: Need to fetch new token, acquire exclusive lock
+        // Slow path: Need to fetch new token
         let _guard = self.refresh_lock.lock().await;
 
-        // Double-check after acquiring lock (another request might have refreshed)
+        // Double-check after acquiring lock
         {
             let token_guard = self.token.read().await;
             if let Some(token) = token_guard.as_ref()
@@ -469,11 +342,9 @@ const INTENTS: u32 = 1 << 25; // GROUP_AND_C2C_EVENT
 
 async fn run_websocket_connection(
     token_manager: &TokenManager,
-    channel_name: &str,
-    orchestrator: &Arc<crate::orchestrator::Orchestrator>,
-    message_bus: &Arc<crate::message_bus::MessageBus>,
     recent_msg_ids: &Arc<RwLock<HashMap<String, String>>>,
     session_state: &Arc<SessionState>,
+    incoming_tx: mpsc::Sender<RawIncoming>,
 ) -> Result<()> {
     // Get access token
     let access_token = token_manager.get_token().await?;
@@ -541,8 +412,8 @@ async fn run_websocket_connection(
                 "shard": [0, 1],
                 "properties": {
                     "$os": "linux",
-                    "$browser": "acpconnector",
-                    "$device": "acpconnector"
+                    "$browser": "acpbridge",
+                    "$device": "acpbridge"
                 }
             })),
             sequence: None,
@@ -588,7 +459,6 @@ async fn run_websocket_connection(
             existing_session_id.unwrap_or_default()
         }
         _ => {
-            // Resume failed or other error, clear session state
             if ready_payload.op_code == op::INVALID_SESSION {
                 warn!("Session invalidated, will create new session on reconnect");
                 session_state.clear().await;
@@ -603,7 +473,7 @@ async fn run_websocket_connection(
 
     // Start heartbeat loop
     let heartbeat_interval = Duration::from_millis(heartbeat_interval);
-    let mut heartbeat_timer = interval(heartbeat_interval);
+    let mut heartbeat_timer = tokio::time::interval(heartbeat_interval);
     let mut last_sequence: Option<u64> = existing_last_seq;
 
     loop {
@@ -646,10 +516,8 @@ async fn run_websocket_connection(
                                     // Handle events
                                     if let Err(e) = handle_event(
                                         &payload,
-                                        channel_name,
-                                        orchestrator,
-                                        message_bus,
                                         recent_msg_ids,
+                                        &incoming_tx,
                                     ).await {
                                         error!(error = %e, "Failed to handle event");
                                     }
@@ -725,42 +593,10 @@ fn parse_ws_message<T: serde::de::DeserializeOwned>(msg: &WsMessage) -> Result<T
     }
 }
 
-/// Parse message content and extract command or text
-/// Handles @mention prefix removal for group messages
-fn parse_message_content(content: &str) -> IncomingContent {
-    // Remove @mention patterns like <@!123456> or leading @bot
-    let content = content.trim();
-
-    // Find the first occurrence of '/' that indicates a command
-    // This handles cases like "@bot /help" or "<@!123> /help"
-    if let Some(cmd_pos) = content.find('/') {
-        let before_cmd = &content[..cmd_pos];
-        let after_cmd = &content[cmd_pos + 1..];
-
-        // Check if before_cmd only contains whitespace and @mentions
-        let is_only_mentions = before_cmd.chars().all(|c| {
-            c.is_whitespace() || c == '@' || c == '<' || c == '>' || c == '!' || c.is_ascii_digit()
-        });
-
-        if is_only_mentions {
-            let rest = after_cmd.trim_start();
-            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-            let name = parts[0].to_lowercase();
-            let args = parts.get(1).map(|s| s.to_string());
-            return IncomingContent::Command { name, args };
-        }
-    }
-
-    // Not a command
-    IncomingContent::Text(content.to_string())
-}
-
 async fn handle_event(
     payload: &GatewayPayload,
-    channel_name: &str,
-    orchestrator: &Arc<crate::orchestrator::Orchestrator>,
-    message_bus: &Arc<crate::message_bus::MessageBus>,
     recent_msg_ids: &Arc<RwLock<HashMap<String, String>>>,
+    incoming_tx: &mpsc::Sender<RawIncoming>,
 ) -> Result<()> {
     let event_type = payload.event_type.as_deref().unwrap_or("");
     let data = payload
@@ -779,37 +615,14 @@ async fn handle_event(
                 ids.insert(chat_id.0.clone(), msg.id.clone());
             }
 
-            let content = parse_message_content(&msg.content);
+            let raw = RawIncoming {
+                chat_id,
+                text: msg.content,
+                is_group: false,
+                is_mentioned: false,
+            };
 
-            // Check for /bot command
-            if let IncomingContent::Command {
-                name: cmd_name,
-                args,
-            } = &content
-                && cmd_name == "bot"
-            {
-                orchestrator
-                    .handle_bot_command(channel_name, &chat_id, args.clone())
-                    .await?;
-                return Ok(());
-            }
-
-            // Get or create bot and dispatch
-            match orchestrator.get_or_create(channel_name, &chat_id).await {
-                Some(bot_name) => {
-                    let key = BotInstanceKey {
-                        channel_name: channel_name.to_string(),
-                        chat_id: chat_id.clone(),
-                        bot_name,
-                    };
-                    message_bus
-                        .dispatch(&key, IncomingMessage { content })
-                        .await?;
-                }
-                None => {
-                    error!("Failed to get or create bot for chat");
-                }
-            }
+            let _ = incoming_tx.send(raw).await;
         }
         "GROUP_AT_MESSAGE_CREATE" => {
             let msg: QqMessage = serde_json::from_value(data.clone())?;
@@ -824,37 +637,15 @@ async fn handle_event(
                 ids.insert(chat_id.0.clone(), msg.id.clone());
             }
 
-            let content = parse_message_content(&msg.content);
+            // For group @ messages, the bot is always mentioned
+            let raw = RawIncoming {
+                chat_id,
+                text: msg.content,
+                is_group: true,
+                is_mentioned: true,
+            };
 
-            // Check for /bot command
-            if let IncomingContent::Command {
-                name: cmd_name,
-                args,
-            } = &content
-                && cmd_name == "bot"
-            {
-                orchestrator
-                    .handle_bot_command(channel_name, &chat_id, args.clone())
-                    .await?;
-                return Ok(());
-            }
-
-            // Get or create bot and dispatch
-            match orchestrator.get_or_create(channel_name, &chat_id).await {
-                Some(bot_name) => {
-                    let key = BotInstanceKey {
-                        channel_name: channel_name.to_string(),
-                        chat_id: chat_id.clone(),
-                        bot_name,
-                    };
-                    message_bus
-                        .dispatch(&key, IncomingMessage { content })
-                        .await?;
-                }
-                None => {
-                    error!("Failed to get or create bot for chat");
-                }
-            }
+            let _ = incoming_tx.send(raw).await;
         }
         "READY" | "RESUMED" => {
             info!(event = %event_type, "QQ Bot session event");
@@ -915,7 +706,6 @@ async fn send_message(
     };
 
     // Send message (truncate if too long, QQ recommends 2000 chars)
-    // Use char count to avoid panic on multi-byte characters
     let content = if content.chars().count() > 2000 {
         let truncated: String = content.chars().take(1997).collect();
         format!("{}...", truncated)
@@ -953,54 +743,6 @@ async fn send_message(
     Ok(())
 }
 
-use std::sync::atomic::{AtomicU64, Ordering};
-
-static MSG_SEQ: AtomicU64 = AtomicU64::new(1);
-
-fn generate_msg_seq() -> u64 {
-    MSG_SEQ.fetch_add(1, Ordering::SeqCst)
-}
-
-/// 检查并 flush 超时的流式缓冲区（30秒超时）
-async fn check_and_flush_timeouts(
-    http_client: &reqwest::Client,
-    token_manager: &crate::channel::qq::TokenManager,
-    stream_buffers: &mut HashMap<String, (String, std::time::Instant)>,
-    recent_msg_ids: &std::sync::Arc<tokio::sync::RwLock<HashMap<String, String>>>,
-) {
-    use tracing::warn;
-
-    const STREAM_TIMEOUT: Duration = Duration::from_secs(30);
-    let now = Instant::now();
-
-    let expired_chat_ids: Vec<String> = stream_buffers
-        .iter()
-        .filter(|(_, (_, ts))| now.duration_since(*ts) > STREAM_TIMEOUT)
-        .map(|(chat_id, _)| chat_id.clone())
-        .collect();
-
-    for chat_id_str in expired_chat_ids {
-        warn!(chat_id = %chat_id_str, "Stream timeout, auto-flushing");
-
-        if let Some((content, _)) = stream_buffers.remove(&chat_id_str)
-            && !content.is_empty()
-        {
-            let chat_id = ChatId(chat_id_str.clone());
-            if let Err(e) = send_message(
-                http_client,
-                token_manager,
-                &chat_id,
-                &content,
-                recent_msg_ids,
-            )
-            .await
-            {
-                error!(error = %e, chat_id = %chat_id_str, "Failed to send timeout stream message");
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1012,5 +754,12 @@ mod tests {
 
         let group_id = ChatId("group:test_group_openid".to_string());
         assert!(group_id.0.starts_with("group:"));
+    }
+
+    #[test]
+    fn test_qq_adapter_new() {
+        let adapter = QqAdapter::new("app_id".to_string(), "secret".to_string(), "test-channel".to_string());
+        assert_eq!(adapter.platform(), "qq");
+        assert_eq!(adapter.max_message_length(), 4096);
     }
 }

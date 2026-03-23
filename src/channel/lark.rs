@@ -1,39 +1,37 @@
-//! Lark/Feishu Bot channel implementation
+//! Lark/Feishu Bot channel adapter implementation
 //!
 //! Implements WebSocket-based connection to Lark/Feishu Open Platform.
 //! Supports p2p (single chat) and Group (@bot) message scenarios.
 
-use crate::channel::{
-    Channel, ChatId, IncomingContent, IncomingMessage, OutgoingContent, OutgoingMessage,
-    should_dispatch_message,
-};
-use crate::message_bus::BotInstanceKey;
+use crate::channel::{ChannelAdapter, ChatId, RawIncoming};
 use anyhow::{Context, Result, anyhow};
 use dashmap::DashMap;
 use reqwest::Client as HttpClient;
 use serde::Deserialize;
-use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 use std::time::{Duration, SystemTime};
 use tokio::sync::{RwLock, mpsc};
-use tokio::time::{MissedTickBehavior, interval, sleep};
+use tokio::time::sleep;
 use tracing::{debug, error, info, warn};
 
 /// Static registry: Lark open_id → channel_name.
-/// Populated at startup when each LarkChannel connects and fetches its own open_id.
+/// Populated at startup when each LarkAdapter connects and fetches its own open_id.
 static LARK_BOT_REGISTRY: LazyLock<DashMap<String, String>> = LazyLock::new(DashMap::new);
 
-/// Lark Bot channel
+/// Lark single message max length
+const MAX_MESSAGE_LENGTH: usize = 4000;
+
+/// Lark Bot adapter
 #[derive(Debug)]
-pub struct LarkChannel {
-    mention_only: bool,
+pub struct LarkAdapter {
     http_client: HttpClient,
     token_manager: Arc<TokenManager>,
     bot_id_cache: Arc<tokio::sync::OnceCell<Option<String>>>,
+    channel_name: String,
 }
 
-impl LarkChannel {
-    pub fn new(app_id: String, app_secret: String, base_url: String, mention_only: bool) -> Self {
+impl LarkAdapter {
+    pub fn new(app_id: String, app_secret: String, base_url: String, channel_name: String) -> Self {
         let http_client = HttpClient::new();
         let token_manager = Arc::new(TokenManager::new(
             app_id,
@@ -42,264 +40,106 @@ impl LarkChannel {
             http_client.clone(),
         ));
         Self {
-            mention_only,
             http_client,
             token_manager,
             bot_id_cache: Arc::new(tokio::sync::OnceCell::new()),
+            channel_name,
+        }
+    }
+
+    /// Get the bot registry for mention formatting
+    pub fn get_registry() -> &'static DashMap<String, String> {
+        &LARK_BOT_REGISTRY
+    }
+
+    /// Get the base URL from the token manager
+    pub fn base_url(&self) -> &str {
+        &self.token_manager.base_url
+    }
+
+    /// Fetch and register bot open_id in the registry
+    async fn register_bot_id(&self) {
+        if let Some(open_id) = get_bot_open_id(&self.token_manager, &self.bot_id_cache).await {
+            LARK_BOT_REGISTRY.insert(open_id, self.channel_name.clone());
+            info!(channel = %self.channel_name, "Registered Lark bot in registry");
+        } else {
+            warn!(channel = %self.channel_name, "Could not fetch Lark bot open_id; mentions will use plain text");
         }
     }
 }
 
 #[async_trait::async_trait]
-impl Channel for LarkChannel {
-    async fn start(
+impl ChannelAdapter for LarkAdapter {
+    fn platform(&self) -> &'static str {
+        "lark"
+    }
+
+    fn max_message_length(&self) -> usize {
+        MAX_MESSAGE_LENGTH
+    }
+
+    async fn run_incoming(
         &self,
-        channel_name: String,
-        orchestrator: Arc<crate::orchestrator::Orchestrator>,
-        message_bus: Arc<crate::message_bus::MessageBus>,
-    ) -> Result<()> {
-        // Eagerly register own open_id so peers can discover us via LARK_BOT_REGISTRY
-        if let Some(open_id) = get_bot_open_id(&self.token_manager, &self.bot_id_cache).await {
-            LARK_BOT_REGISTRY.insert(open_id, channel_name.clone());
-            info!(channel = %channel_name, "Registered Lark bot in registry");
-        } else {
-            warn!(channel = %channel_name, "Could not fetch Lark bot open_id; mentions will use plain text");
-        }
+        incoming_tx: mpsc::Sender<RawIncoming>,
+    ) -> anyhow::Result<()> {
+        // Register bot ID in registry for native mentions
+        self.register_bot_id().await;
 
-        let manager = Arc::new(LarkBotManager::new(
-            self.http_client.clone(),
-            self.token_manager.clone(),
-            self.mention_only,
-            channel_name,
-            orchestrator,
-            message_bus,
-            self.bot_id_cache.clone(),
-        ));
+        let mut reconnect_delay = Duration::from_secs(1);
+        const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
 
-        // Create outgoing channel and register with MessageBus
-        let (outgoing_tx, outgoing_rx) = mpsc::channel::<(ChatId, OutgoingMessage)>(100);
-        manager
-            .message_bus
-            .register_channel(manager.channel_name.clone(), outgoing_tx)
-            .await;
-
-        manager.run(outgoing_rx).await
-    }
-}
-
-/// Lark Bot connection manager
-struct LarkBotManager {
-    http_client: HttpClient,
-    token_manager: Arc<TokenManager>,
-    channel_name: String,
-    orchestrator: Arc<crate::orchestrator::Orchestrator>,
-    message_bus: Arc<crate::message_bus::MessageBus>,
-    mention_only: bool,
-    bot_id_cache: Arc<tokio::sync::OnceCell<Option<String>>>,
-}
-
-impl LarkBotManager {
-    fn new(
-        http_client: HttpClient,
-        token_manager: Arc<TokenManager>,
-        mention_only: bool,
-        channel_name: String,
-        orchestrator: Arc<crate::orchestrator::Orchestrator>,
-        message_bus: Arc<crate::message_bus::MessageBus>,
-        bot_id_cache: Arc<tokio::sync::OnceCell<Option<String>>>,
-    ) -> Self {
-        Self {
-            http_client,
-            token_manager,
-            channel_name,
-            orchestrator,
-            message_bus,
-            mention_only,
-            bot_id_cache,
+        loop {
+            match run_websocket_connection(
+                &self.token_manager,
+                &self.bot_id_cache,
+                incoming_tx.clone(),
+            )
+            .await
+            {
+                Ok(()) => {
+                    error!(
+                        "Lark WebSocket returned Ok unexpectedly, reconnecting in {:?}",
+                        reconnect_delay
+                    );
+                    sleep(reconnect_delay).await;
+                    reconnect_delay = std::cmp::min(reconnect_delay * 2, MAX_RECONNECT_DELAY);
+                }
+                Err(e) => {
+                    error!(error = %e, "Lark WebSocket connection error, reconnecting in {:?}", reconnect_delay);
+                    sleep(reconnect_delay).await;
+                    reconnect_delay = std::cmp::min(reconnect_delay * 2, MAX_RECONNECT_DELAY);
+                }
+            }
         }
     }
 
-    async fn run(&self, mut outgoing_rx: mpsc::Receiver<(ChatId, OutgoingMessage)>) -> Result<()> {
-        let token_manager = self.token_manager.clone();
-        let channel_name = self.channel_name.clone();
-        let orchestrator = self.orchestrator.clone();
-        let message_bus = self.message_bus.clone();
-        let base_url = self.token_manager.base_url.clone();
-        let mention_only = self.mention_only;
-        let bot_id_cache = self.bot_id_cache.clone();
+    async fn send_text(&self, chat_id: &ChatId, text: &str) -> Result<()> {
+        send_long_message(&self.http_client, &self.token_manager, chat_id, text).await
+    }
 
-        // Spawn WebSocket connection task
-        let ws_handle = tokio::spawn(async move {
-            let mut reconnect_delay = Duration::from_secs(1);
-            const MAX_RECONNECT_DELAY: Duration = Duration::from_secs(60);
-
-            loop {
-                match run_websocket_connection(
-                    &token_manager,
-                    &channel_name,
-                    &orchestrator,
-                    &message_bus,
-                    &base_url,
-                    mention_only,
-                    &bot_id_cache,
-                )
-                .await
-                {
-                    Ok(()) => {
-                        // This should not happen - run_websocket_connection only returns Ok on programming errors
-                        // Treat as error and reconnect
-                        error!(
-                            "Lark WebSocket returned Ok unexpectedly, reconnecting in {:?}",
-                            reconnect_delay
-                        );
-                        sleep(reconnect_delay).await;
-                        reconnect_delay = std::cmp::min(reconnect_delay * 2, MAX_RECONNECT_DELAY);
-                    }
-                    Err(e) => {
-                        error!(error = %e, "Lark WebSocket connection error, reconnecting in {:?}", reconnect_delay);
-                        sleep(reconnect_delay).await;
-                        reconnect_delay = std::cmp::min(reconnect_delay * 2, MAX_RECONNECT_DELAY);
-                    }
-                }
-            }
+    fn format_mention(
+        &self,
+        target_bot: &str,
+        target_channel_name: Option<&str>,
+        message: &str,
+    ) -> String {
+        // Look up target's open_id via the static registry
+        let open_id = target_channel_name.and_then(|cn| {
+            LARK_BOT_REGISTRY
+                .iter()
+                .find(|e| e.value() == cn)
+                .map(|e| e.key().clone())
         });
-
-        // Handle outgoing messages
-        let token_manager = self.token_manager.clone();
-        let http_client = self.http_client.clone();
-
-        let outgoing_handle = tokio::spawn(async move {
-            // Local state management for stream buffering
-            let mut stream_buffers: HashMap<String, (String, std::time::Instant)> = HashMap::new();
-
-            // Timer for checking timeouts (5 seconds for more responsive streaming)
-            let mut timeout_checker = interval(Duration::from_secs(5));
-            timeout_checker.set_missed_tick_behavior(MissedTickBehavior::Skip);
-
-            loop {
-                tokio::select! {
-                    // Process new outgoing message
-                    Some((chat_id, msg)) = outgoing_rx.recv() => {
-                        let chat_id_str = chat_id.0.clone();
-
-                        match msg.content {
-                            OutgoingContent::Text(text) => {
-                                // Non-streaming message, send directly (with splitting if needed)
-                                if let Err(e) = send_long_message(
-                                    &http_client,
-                                    &token_manager,
-                                    &chat_id,
-                                    &text,
-                                ).await {
-                                    error!(error = %e, chat_id = %chat_id_str, "Failed to send message");
-                                }
-                            }
-                            OutgoingContent::StreamChunk(text) => {
-                                // Buffer mode: accumulate to buffer, update timestamp
-                                let now = std::time::Instant::now();
-                                let should_flush = {
-                                    let entry = stream_buffers
-                                        .entry(chat_id_str.clone())
-                                        .and_modify(|(buf, ts)| {
-                                            buf.push_str(&text);
-                                            *ts = now;
-                                        })
-                                        .or_insert((text.clone(), now));
-
-                                    // Pseudo-streaming: flush if buffer exceeds 500 chars
-                                    entry.0.chars().count() >= 500
-                                };
-
-                                // Flush immediately if buffer is large enough
-                                if should_flush
-                                    && let Some((content, _)) = stream_buffers.remove(&chat_id_str)
-                                    && !content.is_empty()
-                                    && let Err(e) = send_long_message(
-                                        &http_client,
-                                        &token_manager,
-                                        &chat_id,
-                                        &content,
-                                    )
-                                    .await
-                                {
-                                    error!(error = %e, chat_id = %chat_id_str, "Failed to send stream chunk");
-                                }
-                            }
-                            OutgoingContent::StreamEnd => {
-                                // Stream end: send buffered content and remove from HashMap (avoid memory leak)
-                                if let Some((content, _)) = stream_buffers.remove(&chat_id_str)
-                                    && !content.is_empty()
-                                    && let Err(e) = send_long_message(
-                                        &http_client,
-                                        &token_manager,
-                                        &chat_id,
-                                        &content,
-                                    )
-                                    .await
-                                {
-                                    error!(error = %e, chat_id = %chat_id_str, "Failed to send stream message");
-                                }
-                            }
-                            OutgoingContent::Error(err) => {
-                                let content = format!("Error: {}", err);
-                                if let Err(e) = send_long_message(
-                                    &http_client,
-                                    &token_manager,
-                                    &chat_id,
-                                    &content,
-                                ).await {
-                                    error!(error = %e, chat_id = %chat_id_str, "Failed to send error");
-                                }
-                            }
-                            OutgoingContent::Mention { target_bot, target_channel_name, message } => {
-                                // Look up target's open_id via the static registry
-                                let open_id = target_channel_name.as_deref().and_then(|cn| {
-                                    LARK_BOT_REGISTRY
-                                        .iter()
-                                        .find(|e| e.value() == cn)
-                                        .map(|e| e.key().clone())
-                                });
-                                let full_message = match open_id {
-                                    Some(id) => format!(
-                                        "<at user_id=\"{}\">@{}</at> {}",
-                                        id, target_bot, message
-                                    ),
-                                    None => {
-                                        warn!(target_bot = %target_bot, "Target bot open_id not in registry, falling back to plain mention");
-                                        format!("@{} {}", target_bot, message)
-                                    }
-                                };
-                                if let Err(e) = send_long_message(
-                                    &http_client,
-                                    &token_manager,
-                                    &chat_id,
-                                    &full_message,
-                                ).await {
-                                    error!(error = %e, chat_id = %chat_id_str, "Failed to send mention");
-                                }
-                            }
-                        }
-                    }
-                    // Periodic timeout check (10 seconds for better responsiveness)
-                    _ = timeout_checker.tick() => {
-                        check_and_flush_timeouts(
-                            &http_client,
-                            &token_manager,
-                            &mut stream_buffers,
-                        ).await;
-                    }
-                    // Exit when channel closed
-                    else => break,
-                }
+        match open_id {
+            Some(id) => format!(
+                "<at user_id=\"{}\">@{}</at> {}",
+                id, target_bot, message
+            ),
+            None => {
+                warn!(target_bot = %target_bot, "Target bot open_id not in registry, falling back to plain mention");
+                format!("@{} {}", target_bot, message)
             }
-        });
-
-        tokio::select! {
-            _ = ws_handle => {},
-            _ = outgoing_handle => {},
         }
-
-        Ok(())
     }
 }
 
@@ -311,7 +151,6 @@ struct TokenManager {
     base_url: String,
     http_client: HttpClient,
     token: RwLock<Option<TokenInfo>>,
-    /// Mutex to ensure only one request fetches token at a time
     refresh_lock: tokio::sync::Mutex<()>,
 }
 
@@ -334,7 +173,7 @@ impl TokenManager {
     }
 
     async fn get_token(&self) -> Result<String> {
-        // Fast path: Check if we have a valid cached token (read lock only)
+        // Fast path: Check if we have a valid cached token
         {
             let token_guard = self.token.read().await;
             if let Some(token) = token_guard.as_ref()
@@ -344,10 +183,10 @@ impl TokenManager {
             }
         }
 
-        // Slow path: Need to fetch new token, acquire exclusive lock
+        // Slow path: Need to fetch new token
         let _guard = self.refresh_lock.lock().await;
 
-        // Double-check after acquiring lock (another request might have refreshed)
+        // Double-check after acquiring lock
         {
             let token_guard = self.token.read().await;
             if let Some(token) = token_guard.as_ref()
@@ -535,12 +374,8 @@ fn message_mentions_bot(text: &str, mentions: &[MentionEntry], bot_open_id: &str
 
 async fn run_websocket_connection(
     token_manager: &Arc<TokenManager>,
-    channel_name: &str,
-    orchestrator: &Arc<crate::orchestrator::Orchestrator>,
-    message_bus: &Arc<crate::message_bus::MessageBus>,
-    base_url: &str,
-    mention_only: bool,
     bot_id_cache: &Arc<tokio::sync::OnceCell<Option<String>>>,
+    incoming_tx: mpsc::Sender<RawIncoming>,
 ) -> Result<()> {
     use openlark_client::Config as LarkConfig;
     use openlark_client::ws_client::{EventDispatcherHandler, LarkWsClient};
@@ -550,7 +385,7 @@ async fn run_websocket_connection(
     let ws_config = LarkConfig::builder()
         .app_id(token_manager.app_id.clone())
         .app_secret(token_manager.app_secret.clone())
-        .base_url(base_url)
+        .base_url(&token_manager.base_url)
         .build()
         .map_err(|e| anyhow!("Failed to build Lark config: {:?}", e))?;
 
@@ -571,6 +406,9 @@ async fn run_websocket_connection(
 
     info!("Lark WebSocket client started");
 
+    // Get bot open_id for mention checking
+    let bot_open_id = get_bot_open_id(token_manager, bot_id_cache).await;
+
     // Process events
     loop {
         tokio::select! {
@@ -582,12 +420,9 @@ async fn run_websocket_connection(
                 );
                 if let Err(e) = handle_event(
                     &payload,
-                    channel_name,
-                    orchestrator,
-                    message_bus,
                     token_manager,
-                    mention_only,
-                    bot_id_cache,
+                    &incoming_tx,
+                    bot_open_id.as_deref(),
                 ).await {
                     error!(error = %e, "Failed to handle event");
                 }
@@ -610,111 +445,11 @@ async fn run_websocket_connection(
     }
 }
 
-/// Parse message content and extract command or text
-///
-/// Lark's @mention format: <at user_id="ou_xxx">@Name</at>
-/// We need to be permissive about characters before the command
-fn parse_message_content(content: &str) -> IncomingContent {
-    let content = content.trim();
-
-    // Find command position - look for "/" followed by a letter at word boundary
-    // The command should be:
-    // 1. At the start of the message, OR
-    // 2. After whitespace (not inside a tag like </at>)
-    let mut cmd_pos = None;
-    let chars: Vec<char> = content.chars().collect();
-
-    for (i, c) in chars.iter().enumerate() {
-        if *c == '/' {
-            // Check if this "/" is at a command position:
-            // - Must be at start OR preceded by whitespace
-            // - Next char must exist and be a letter
-            let is_at_start = i == 0;
-            let is_after_whitespace = i > 0 && chars[i - 1].is_whitespace();
-            let is_command_position = is_at_start || is_after_whitespace;
-
-            if is_command_position && i + 1 < chars.len() && chars[i + 1].is_ascii_alphabetic() {
-                cmd_pos = Some(i);
-                break;
-            }
-        }
-    }
-
-    if let Some(pos) = cmd_pos {
-        let before_cmd = &content[..pos];
-        let after_cmd = &content[pos + 1..];
-
-        // Check if before_cmd only contains whitespace and @mentions.
-        // Lark uses two mention formats:
-        //   - New: @_user_N placeholder (e.g. "@_user_1 ") with a separate mentions array
-        //   - Legacy XML: <at user_id="ou_xxx">@Name</at>
-        // Both are handled by the permissive character allowlist below.
-        let is_only_mentions = before_cmd.chars().all(|c| {
-            c.is_whitespace()
-                || c.is_ascii_alphanumeric()
-                || matches!(c, '<' | '>' | '/' | '=' | '"' | '_' | '@' | '!')
-        });
-
-        if is_only_mentions {
-            let rest = after_cmd.trim_start();
-            let parts: Vec<&str> = rest.splitn(2, ' ').collect();
-            let name = parts[0].to_lowercase();
-            let args = parts.get(1).map(|s| s.to_string());
-            return IncomingContent::Command { name, args };
-        }
-    }
-
-    // Not a command
-    IncomingContent::Text(content.to_string())
-}
-
-/// Send an emoji reaction to a Lark message as an immediate acknowledgement.
-/// Best-effort: logs a warning on failure but never propagates the error.
-async fn send_reaction(
-    http_client: &HttpClient,
-    token_manager: &TokenManager,
-    message_id: &str,
-) -> Result<()> {
-    let access_token = token_manager.get_token().await?;
-
-    let url = format!(
-        "{}/open-apis/im/v1/messages/{}/reactions",
-        token_manager.base_url, message_id
-    );
-
-    let body = serde_json::json!({
-        "reaction_type": {
-            "emoji_type": "THUMBSUP"
-        }
-    });
-
-    let response = http_client
-        .post(&url)
-        .header("Authorization", format!("Bearer {}", access_token))
-        .header("Content-Type", "application/json")
-        .json(&body)
-        .send()
-        .await
-        .context("Failed to send reaction request")?;
-
-    if !response.status().is_success() {
-        let status = response.status();
-        let text = response.text().await.unwrap_or_default();
-        return Err(anyhow!("Send reaction failed: {} - {}", status, text));
-    }
-
-    debug!(message_id = %message_id, "Reaction sent successfully");
-    Ok(())
-}
-
 async fn handle_event(
     payload: &[u8],
-    channel_name: &str,
-    orchestrator: &Arc<crate::orchestrator::Orchestrator>,
-    message_bus: &Arc<crate::message_bus::MessageBus>,
     token_manager: &Arc<TokenManager>,
-    mention_only: bool,
-    bot_id_cache: &Arc<tokio::sync::OnceCell<Option<String>>>,
+    incoming_tx: &mpsc::Sender<RawIncoming>,
+    bot_open_id: Option<&str>,
 ) -> Result<()> {
     let envelope: EventEnvelope =
         serde_json::from_slice(payload).context("Failed to parse event envelope")?;
@@ -766,24 +501,14 @@ async fn handle_event(
         }
     };
 
-    let content = parse_message_content(&text_content.text);
-    let is_group_chat = message_event.message.chat_type == "group";
-    let is_mentioned = if mention_only && is_group_chat {
-        get_bot_open_id(token_manager, bot_id_cache)
-            .await
-            .is_some_and(|bot_open_id| {
-                message_mentions_bot(
-                    &text_content.text,
-                    &message_event.message.mentions,
-                    &bot_open_id,
-                )
-            })
-    } else {
-        false
-    };
-    if !should_dispatch_message(mention_only, is_group_chat, is_mentioned) {
-        return Ok(());
-    }
+    let is_group = message_event.message.chat_type == "group";
+    let is_mentioned = bot_open_id.is_some_and(|bot_id| {
+        message_mentions_bot(
+            &text_content.text,
+            &message_event.message.mentions,
+            bot_id,
+        )
+    });
 
     // Immediately acknowledge the message with a reaction to satisfy Lark's 3-second
     // long-connection processing requirement and signal to the user that the bot is working.
@@ -795,37 +520,54 @@ async fn handle_event(
         }
     });
 
-    // Check for /bot command
-    if let IncomingContent::Command {
-        name: cmd_name,
-        args,
-    } = &content
-        && cmd_name == "bot"
-    {
-        orchestrator
-            .handle_bot_command(channel_name, &chat_id, args.clone())
-            .await?;
-        return Ok(());
+    let raw = RawIncoming {
+        chat_id,
+        text: text_content.text,
+        is_group,
+        is_mentioned,
+    };
+
+    let _ = incoming_tx.send(raw).await;
+
+    Ok(())
+}
+
+/// Send an emoji reaction to a Lark message as an immediate acknowledgement.
+/// Best-effort: logs a warning on failure but never propagates the error.
+async fn send_reaction(
+    http_client: &HttpClient,
+    token_manager: &TokenManager,
+    message_id: &str,
+) -> Result<()> {
+    let access_token = token_manager.get_token().await?;
+
+    let url = format!(
+        "{}/open-apis/im/v1/messages/{}/reactions",
+        token_manager.base_url, message_id
+    );
+
+    let body = serde_json::json!({
+        "reaction_type": {
+            "emoji_type": "THUMBSUP"
+        }
+    });
+
+    let response = http_client
+        .post(&url)
+        .header("Authorization", format!("Bearer {}", access_token))
+        .header("Content-Type", "application/json")
+        .json(&body)
+        .send()
+        .await
+        .context("Failed to send reaction request")?;
+
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(anyhow!("Send reaction failed: {} - {}", status, text));
     }
 
-    // Get or create bot and dispatch
-    match orchestrator.get_or_create(channel_name, &chat_id).await {
-        Some(bot_name) => {
-            let key = BotInstanceKey {
-                channel_name: channel_name.to_string(),
-                chat_id: chat_id.clone(),
-                bot_name,
-            };
-            message_bus
-                .dispatch(&key, IncomingMessage { content })
-                .await
-                .context("Failed to send incoming message")?;
-        }
-        None => {
-            error!("Failed to get or create bot for chat");
-        }
-    }
-
+    debug!(message_id = %message_id, "Reaction sent successfully");
     Ok(())
 }
 
@@ -836,8 +578,6 @@ async fn send_long_message(
     chat_id: &ChatId,
     content: &str,
 ) -> Result<()> {
-    const MAX_MESSAGE_LENGTH: usize = 4000;
-
     let char_count = content.chars().count();
 
     if char_count <= MAX_MESSAGE_LENGTH {
@@ -926,63 +666,6 @@ async fn send_single_message(
     Ok(())
 }
 
-/// Check and flush timed-out stream buffers (10 second timeout for better responsiveness)
-async fn check_and_flush_timeouts(
-    http_client: &HttpClient,
-    token_manager: &TokenManager,
-    stream_buffers: &mut HashMap<String, (String, std::time::Instant)>,
-) {
-    const STREAM_TIMEOUT: Duration = Duration::from_secs(10);
-    const MAX_BUFFER_COUNT: usize = 1000; // Memory safety limit
-    let now = std::time::Instant::now();
-
-    // Check for timeout
-    let expired_chat_ids: Vec<String> = stream_buffers
-        .iter()
-        .filter(|(_, (_, ts))| now.duration_since(*ts) > STREAM_TIMEOUT)
-        .map(|(chat_id, _)| chat_id.clone())
-        .collect();
-
-    for chat_id_str in expired_chat_ids {
-        warn!(chat_id = %chat_id_str, "Stream timeout, auto-flushing");
-
-        if let Some((content, _)) = stream_buffers.remove(&chat_id_str)
-            && !content.is_empty()
-        {
-            let chat_id = ChatId(chat_id_str.clone());
-            if let Err(e) = send_long_message(http_client, token_manager, &chat_id, &content).await
-            {
-                error!(error = %e, chat_id = %chat_id_str, "Failed to send timeout stream message");
-            }
-        }
-    }
-
-    // Memory safety: if too many buffers, flush the oldest ones
-    if stream_buffers.len() > MAX_BUFFER_COUNT {
-        let mut entries: Vec<(String, std::time::Instant)> = stream_buffers
-            .iter()
-            .map(|(k, (_, ts))| (k.clone(), *ts))
-            .collect();
-        entries.sort_by(|a, b| a.1.cmp(&b.1));
-
-        let to_remove = stream_buffers.len() - MAX_BUFFER_COUNT;
-        for (chat_id_str, _) in entries.into_iter().take(to_remove) {
-            warn!(chat_id = %chat_id_str, "Too many stream buffers, flushing oldest");
-
-            if let Some((content, _)) = stream_buffers.remove(&chat_id_str)
-                && !content.is_empty()
-            {
-                let chat_id = ChatId(chat_id_str.clone());
-                if let Err(e) =
-                    send_long_message(http_client, token_manager, &chat_id, &content).await
-                {
-                    error!(error = %e, chat_id = %chat_id_str, "Failed to send buffer overflow message");
-                }
-            }
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -997,96 +680,14 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_message_content_text() {
-        let content = parse_message_content("Hello world");
-        match content {
-            IncomingContent::Text(t) => assert_eq!(t, "Hello world"),
-            _ => panic!("Expected Text content"),
-        }
-    }
-
-    #[test]
-    fn test_parse_message_content_command() {
-        let content = parse_message_content("/help");
-        match content {
-            IncomingContent::Command { name, args } => {
-                assert_eq!(name, "help");
-                assert!(args.is_none());
-            }
-            _ => panic!("Expected Command content"),
-        }
-    }
-
-    #[test]
-    fn test_parse_message_content_command_with_args() {
-        let content = parse_message_content("/model gpt-4");
-        match content {
-            IncomingContent::Command { name, args } => {
-                assert_eq!(name, "model");
-                assert_eq!(args, Some("gpt-4".to_string()));
-            }
-            _ => panic!("Expected Command content"),
-        }
-    }
-
-    #[test]
-    fn test_parse_message_content_command_with_at() {
-        let content = parse_message_content("<@!123456> /help");
-        match content {
-            IncomingContent::Command { name, args } => {
-                assert_eq!(name, "help");
-                assert!(args.is_none());
-            }
-            _ => panic!("Expected Command content"),
-        }
-    }
-
-    #[test]
-    fn test_parse_message_content_lark_at_format() {
-        // Test Lark's actual @ format
-        let content = parse_message_content("<at user_id=\"ou_123abc\">@Bot</at> /help");
-        match content {
-            IncomingContent::Command { name, args } => {
-                assert_eq!(name, "help");
-                assert!(args.is_none());
-            }
-            _ => panic!("Expected Command content for Lark @ format"),
-        }
-    }
-
-    #[test]
-    fn test_parse_message_content_lark_at_with_args() {
-        let content = parse_message_content("<at user_id=\"ou_xxx\">@Bot</at> /model gpt-4");
-        match content {
-            IncomingContent::Command { name, args } => {
-                assert_eq!(name, "model");
-                assert_eq!(args, Some("gpt-4".to_string()));
-            }
-            _ => panic!("Expected Command content"),
-        }
-    }
-
-    #[test]
-    fn test_message_mentions_bot() {
-        // New format: @_user_N placeholder in text + mentions array
-        let mentions = vec![MentionEntry {
-            id: MentionId {
-                open_id: "ou_bot".to_string(),
-            },
-        }];
-        assert!(message_mentions_bot("@_user_1 hello", &mentions, "ou_bot"));
-        assert!(!message_mentions_bot("@_user_1 hello", &mentions, "ou_other"));
-
-        // Legacy XML format: <at user_id="ou_xxx"> in text, no mentions array
-        assert!(message_mentions_bot(
-            "<at user_id=\"ou_bot\">@Bot</at> hello",
-            &[],
-            "ou_bot"
-        ));
-        assert!(!message_mentions_bot(
-            "<at user_id=\"ou_other\">@Other</at> hello",
-            &[],
-            "ou_bot"
-        ));
+    fn test_lark_adapter_new() {
+        let adapter = LarkAdapter::new(
+            "app_id".to_string(),
+            "secret".to_string(),
+            "https://open.feishu.cn".to_string(),
+            "test-channel".to_string(),
+        );
+        assert_eq!(adapter.platform(), "lark");
+        assert_eq!(adapter.max_message_length(), 4000);
     }
 }

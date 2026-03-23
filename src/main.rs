@@ -1,6 +1,9 @@
 //! ACP Connector - Bridge between messaging platforms and ACP Agent CLI
 
-use acpbridge::{config, channel, message_bus, orchestrator, mcp_server};
+use acpbridge::{
+    channel::{ChannelOrchestrator, DiscordAdapter, LarkAdapter, QqAdapter, TelegramAdapter, WeChatAdapter, WeChatConfig},
+    config, mcp_server, message_bus, orchestrator,
+};
 
 use anyhow::Result;
 use std::path::PathBuf;
@@ -63,51 +66,49 @@ async fn main() -> Result<()> {
 
             for channel_config in &config.channels {
                 let channel_name = channel_config.name.clone();
+                let mention_only = channel_config.mention_only;
 
-                // Create the platform-specific channel
-                let channel: Arc<dyn channel::Channel> = match &channel_config.platform {
-                    config::PlatformConfig::Telegram { telegram } => {
-                        Arc::new(channel::TelegramChannel::new(
-                            telegram.token.clone(),
-                            channel_config.mention_only,
-                        ))
-                    }
-                    config::PlatformConfig::Qq { qq } => Arc::new(channel::QqChannel::new(
-                        qq.app_id.clone(),
-                        qq.client_secret.clone(),
-                        channel_config.mention_only,
-                    )),
-                    config::PlatformConfig::Lark { lark } => Arc::new(channel::LarkChannel::new(
-                        lark.app_id.clone(),
-                        lark.app_secret.clone(),
-                        lark.base_url.clone(),
-                        channel_config.mention_only,
-                    )),
-                    config::PlatformConfig::Wechat { wechat } => {
-                        let wechat_config = channel::WeChatConfig::new(
-                            wechat.bot_token.clone(),
-                            Some(wechat.base_url.clone()),
-                        );
-                        Arc::new(channel::WeChatChannel::new(
-                            wechat_config,
-                            channel_config.mention_only,
-                        ))
-                    }
-                    config::PlatformConfig::Discord { discord } => {
-                        Arc::new(channel::DiscordChannel::new(
-                            discord.bot_token.clone(),
-                            discord.guild_ids.clone(),
-                            channel_config.mention_only,
-                        ))
-                    }
-                };
+                // Create the platform-specific adapter
+                let adapter: Arc<dyn acpbridge::channel::ChannelAdapter> =
+                    match &channel_config.platform {
+                        config::PlatformConfig::Telegram { telegram } => {
+                            Arc::new(TelegramAdapter::new(telegram.token.clone()))
+                        }
+                        config::PlatformConfig::Qq { qq } => Arc::new(QqAdapter::new(
+                            qq.app_id.clone(),
+                            qq.client_secret.clone(),
+                            channel_name.clone(),
+                        )),
+                        config::PlatformConfig::Lark { lark } => Arc::new(LarkAdapter::new(
+                            lark.app_id.clone(),
+                            lark.app_secret.clone(),
+                            lark.base_url.clone(),
+                            channel_name.clone(),
+                        )),
+                        config::PlatformConfig::Wechat { wechat } => {
+                            let wechat_config =
+                                WeChatConfig::new(wechat.bot_token.clone(), Some(wechat.base_url.clone()));
+                            Arc::new(WeChatAdapter::new(wechat_config))
+                        }
+                        config::PlatformConfig::Discord { discord } => {
+                            Arc::new(DiscordAdapter::new(
+                                discord.bot_token.clone(),
+                                discord.guild_ids.clone(),
+                                channel_name.clone(),
+                            ))
+                        }
+                    };
 
-                let orch = orchestrator.clone();
-                let mb = message_bus.clone();
-                let name = channel_name.clone();
+                // Create channel orchestrator for this channel
+                let channel_orchestrator = ChannelOrchestrator::new(
+                    channel_name.clone(),
+                    mention_only,
+                    orchestrator.clone(),
+                    message_bus.clone(),
+                );
 
                 let handle = tokio::spawn(async move {
-                    if let Err(e) = channel.start(name, orch, mb).await {
+                    if let Err(e) = channel_orchestrator.run(adapter).await {
                         error!(error = %e, channel = %channel_name, "Channel error");
                     }
                 });
@@ -140,7 +141,7 @@ async fn main() -> Result<()> {
 
 fn init_logging() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,acpconnector=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("info,acpbridge=debug"));
 
     tracing_subscriber::fmt()
         .with_env_filter(filter)

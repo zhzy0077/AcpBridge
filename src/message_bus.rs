@@ -50,6 +50,12 @@ pub struct BotReceiver {
     pub event_rx: mpsc::Receiver<BotEvent>,
 }
 
+impl Default for MessageBus {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MessageBus {
     /// Create a new empty MessageBus.
     pub fn new() -> Self {
